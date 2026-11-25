@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Dịch Phim Trực Tiếp</string>
+    <string name="app_name">Origin Sub</string>
     <string name="status_ready">Sẵn sàng</string>
     <string name="status_translating">Đang dịch</string>
 
-    <string name="audio_signal_label">Mức âm thanh trình duyệt</string>
-    <string name="live_preview_placeholder">Phụ đề trực tiếp sẽ hiện tại đây…</string>
+    <string name="hero_live_idle">Trực tiếp</string>
+    <string name="hero_live_running">Đang thu âm</string>
+    <string name="audio_signal_label">Mức âm thanh</string>
+    <string name="live_preview_placeholder">Phụ đề tiếng Việt sẽ hiển thị tại đây…</string>
 
     <string name="section_language">Ngôn ngữ phim</string>
     <string name="lang_english">Anh</string>
@@ -14,34 +16,37 @@
     <string name="lang_russian">Nga</string>
 
     <string name="model_checking">Đang kiểm tra…</string>
-    <string name="model_ready">Đã sẵn sàng (%1$s)</string>
-    <string name="model_missing">Chưa tải (%1$d MB)</string>
-    <string name="btn_download_short">Tải về</string>
+    <string name="model_package_title">Gói %1$s · %2$d MB</string>
+    <string name="model_ready_offline">Đã sẵn sàng offline</string>
+    <string name="model_not_downloaded">Chưa tải dữ liệu</string>
+    <string name="model_downloading_percent">Đang tải… %1$d%%</string>
+    <string name="btn_download_short">Tải</string>
     <string name="download_complete">Tải dữ liệu hoàn tất</string>
     <string name="download_error">Lỗi tải dữ liệu: %1$s</string>
 
     <string name="section_output">Đầu ra</string>
-    <string name="option_overlay_title">Phụ đề nổi trên màn hình</string>
-    <string name="option_tts_title">Đọc tiếng Việt vào tai nghe</string>
-    <string name="option_show_original_title">Hiển thị kèm câu gốc</string>
+    <string name="option_overlay_title">Phụ đề nổi</string>
+    <string name="option_tts_title">Đọc vào tai nghe</string>
+    <string name="option_show_original_title">Hiện kèm câu gốc</string>
 
     <string name="btn_start_translate">Bắt đầu dịch</string>
     <string name="btn_stop_translate">Dừng dịch</string>
     <string name="btn_open_edge">Edge Canary</string>
 
-    <string name="msg_download_first">Vui lòng tải dữ liệu %1$s trước</string>
+    <string name="msg_download_first">Vui lòng tải gói %1$s trước khi bắt đầu</string>
     <string name="msg_enable_one_output">Hãy bật ít nhất một đầu ra</string>
     <string name="msg_need_audio_permission">Cần cấp quyền âm thanh để thu tiếng trình duyệt</string>
     <string name="msg_need_overlay_permission">Cần cấp quyền Hiển thị trên ứng dụng khác</string>
     <string name="msg_edge_not_found">Không tìm thấy Edge Canary trên thiết bị</string>
 
+    <string name="app_version_format">Phiên bản %1$s</string>
     <string name="btn_check_update">Kiểm tra cập nhật</string>
-    <string name="update_checking">Đang kiểm tra…</string>
     <string name="update_available_title">Có bản mới %1$s</string>
-    <string name="update_now">Cập nhật</string>
+    <string name="update_now">Cập nhật ngay</string>
     <string name="update_later">Để sau</string>
     <string name="update_downloading_title">Đang tải bản cập nhật</string>
-    <string name="update_downloading_progress">Đang tải… %1$d%%</string>
-    <string name="update_up_to_date">Đang dùng bản mới nhất (%1$s)</string>
-    <string name="update_error">Lỗi cập nhật: %1$s</string>
+    <string name="update_downloading_status">Đang tải gói cài đặt APK…</string>
+    <string name="update_percent_format">%1$d%%</string>
+    <string name="update_up_to_date">Đang dùng phiên bản mới nhất (%1$s)</string>
+    <string name="update_error">Không thể kiểm tra cập nhật: %1$s</string>
 </resources>

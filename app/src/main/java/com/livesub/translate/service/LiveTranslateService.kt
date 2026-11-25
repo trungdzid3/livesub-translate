@@ -429,7 +429,7 @@ class LiveTranslateService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("LiveSub Translate")
+            .setContentTitle("Origin Sub")
             .setContentText(content)
             .setSmallIcon(R.drawable.ic_subtitles)
             .setContentIntent(openIntent)

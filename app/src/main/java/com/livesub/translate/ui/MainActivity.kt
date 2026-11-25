@@ -44,6 +44,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var modelManager: ModelManager
     private var selectedLanguage = FilmLanguage.ENGLISH
+    private var isDownloadingModel = false
 
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -126,7 +127,7 @@ class MainActivity : AppCompatActivity() {
         applyEdgeToEdgeInsets()
 
         modelManager = ModelManager(this)
-        setupLanguageChips()
+        setupLanguageSelector()
         setupControls()
         setupVersionAndUpdater()
         refreshModelStatus()
@@ -166,17 +167,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupLanguageChips() {
-        binding.chipGroupLang.setOnCheckedStateChangeListener { _, checkedIds ->
-            val id = checkedIds.firstOrNull() ?: return@setOnCheckedStateChangeListener
-            selectedLanguage = when (id) {
-                R.id.chipEn -> FilmLanguage.ENGLISH
-                R.id.chipZh -> FilmLanguage.CHINESE
-                R.id.chipJa -> FilmLanguage.JAPANESE
-                R.id.chipRu -> FilmLanguage.RUSSIAN
+    private fun setupLanguageSelector() {
+        binding.toggleGroupLang.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            selectedLanguage = when (checkedId) {
+                R.id.btnLangEn -> FilmLanguage.ENGLISH
+                R.id.btnLangZh -> FilmLanguage.CHINESE
+                R.id.btnLangJa -> FilmLanguage.JAPANESE
+                R.id.btnLangRu -> FilmLanguage.RUSSIAN
                 else -> FilmLanguage.ENGLISH
             }
-            refreshModelStatus()
+            if (!isDownloadingModel) {
+                refreshModelStatus()
+            }
         }
     }
 
@@ -223,39 +226,61 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshModelStatus() {
+        binding.tvModelTitle.text = getString(
+            R.string.model_package_title,
+            selectedLanguage.displayName,
+            selectedLanguage.approxSizeMb
+        )
         val ready = modelManager.isAsrModelReady(selectedLanguage)
+        binding.progressModelCircle.visibility = View.GONE
+        binding.progressDownload.visibility = View.GONE
+        binding.tvDownloadPercent.visibility = View.GONE
+        binding.ivModelState.visibility = View.VISIBLE
+
         if (ready) {
-            binding.tvModelStatus.text = getString(R.string.model_ready, selectedLanguage.displayName)
+            binding.tvModelStatus.text = getString(R.string.model_ready_offline)
             binding.ivModelState.setImageResource(R.drawable.ic_check_circle)
+            binding.cardModelIconBg.setCardBackgroundColor(
+                MaterialColors.getColor(binding.cardModelIconBg, com.google.android.material.R.attr.colorPrimaryContainer)
+            )
             binding.ivModelState.imageTintList = ColorStateList.valueOf(
-                MaterialColors.getColor(binding.ivModelState, com.google.android.material.R.attr.colorPrimary)
+                MaterialColors.getColor(binding.ivModelState, com.google.android.material.R.attr.colorOnPrimaryContainer)
             )
             binding.btnDownloadModel.visibility = View.GONE
         } else {
-            binding.tvModelStatus.text = getString(
-                R.string.model_missing,
-                selectedLanguage.approxSizeMb
-            )
+            binding.tvModelStatus.text = getString(R.string.model_not_downloaded)
             binding.ivModelState.setImageResource(R.drawable.ic_download)
+            binding.cardModelIconBg.setCardBackgroundColor(
+                MaterialColors.getColor(binding.cardModelIconBg, com.google.android.material.R.attr.colorSurfaceContainerHighest)
+            )
             binding.ivModelState.imageTintList = ColorStateList.valueOf(
                 MaterialColors.getColor(binding.ivModelState, com.google.android.material.R.attr.colorOnSurfaceVariant)
             )
             binding.btnDownloadModel.visibility = View.VISIBLE
+            binding.btnDownloadModel.isEnabled = true
         }
     }
 
     private fun downloadSelectedLanguageModel() {
-        binding.btnDownloadModel.isEnabled = false
+        isDownloadingModel = true
+        binding.btnDownloadModel.visibility = View.GONE
         binding.btnToggleService.isEnabled = false
+        binding.ivModelState.visibility = View.GONE
+        binding.progressModelCircle.visibility = View.VISIBLE
+        binding.tvDownloadPercent.visibility = View.VISIBLE
+        binding.tvDownloadPercent.text = getString(R.string.update_percent_format, 0)
         binding.progressDownload.visibility = View.VISIBLE
         binding.progressDownload.progress = 0
+        binding.tvModelStatus.text = getString(R.string.model_downloading_percent, 0)
 
         lifecycleScope.launch {
             try {
                 modelManager.ensureModelsReady(selectedLanguage) { status, percent ->
                     runOnUiThread {
+                        val clamped = percent.coerceIn(0, 100)
                         binding.tvModelStatus.text = status
-                        binding.progressDownload.setProgress(percent, true)
+                        binding.tvDownloadPercent.text = getString(R.string.update_percent_format, clamped)
+                        binding.progressDownload.setProgress(clamped, true)
                     }
                 }
                 Toast.makeText(this@MainActivity, R.string.download_complete, Toast.LENGTH_SHORT).show()
@@ -264,9 +289,8 @@ class MainActivity : AppCompatActivity() {
                 binding.tvModelStatus.text = msg
                 Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
             } finally {
-                binding.btnDownloadModel.isEnabled = true
+                isDownloadingModel = false
                 binding.btnToggleService.isEnabled = true
-                binding.progressDownload.visibility = View.GONE
                 refreshModelStatus()
             }
         }
@@ -330,6 +354,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateUiState(isRunning: Boolean) {
         if (isRunning) {
             binding.tvStatusBadge.text = getString(R.string.status_translating)
+            binding.tvHeroStatusTitle.text = getString(R.string.hero_live_running)
 
             val containerBg = MaterialColors.getColor(binding.badgeStatusCard, com.google.android.material.R.attr.colorPrimaryContainer)
             val onContainer = MaterialColors.getColor(binding.tvStatusBadge, com.google.android.material.R.attr.colorOnPrimaryContainer)
@@ -346,6 +371,7 @@ class MainActivity : AppCompatActivity() {
             binding.btnToggleService.iconTint = ColorStateList.valueOf(onErrorColor)
         } else {
             binding.tvStatusBadge.text = getString(R.string.status_ready)
+            binding.tvHeroStatusTitle.text = getString(R.string.hero_live_idle)
 
             val surfaceHigh = MaterialColors.getColor(binding.badgeStatusCard, com.google.android.material.R.attr.colorSurfaceContainerHigh)
             val onSurfaceVar = MaterialColors.getColor(binding.tvStatusBadge, com.google.android.material.R.attr.colorOnSurfaceVariant)
@@ -366,9 +392,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupVersionAndUpdater() {
+        val currentVersion = getCurrentVersionName()
+        binding.tvAppVersion.text = getString(R.string.app_version_format, currentVersion)
+
         binding.btnCheckUpdate.setOnClickListener {
             checkForUpdates(silent = false)
         }
+
         checkForUpdates(silent = true)
     }
 
@@ -392,15 +422,15 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             try {
-                val currentVer = getCurrentVersionName()
-                val updateInfo = AppUpdater.checkForUpdate(currentVer)
+                val currentVersion = getCurrentVersionName()
+                val updateInfo = AppUpdater.checkForUpdate(currentVersion)
                 if (isFinishing || isDestroyed) return@launch
                 if (updateInfo != null) {
                     showUpdateDialog(updateInfo)
                 } else if (!silent) {
                     Toast.makeText(
                         this@MainActivity,
-                        getString(R.string.update_up_to_date, currentVer),
+                        getString(R.string.update_up_to_date, currentVersion),
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -434,26 +464,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun downloadAndInstallUpdate(info: UpdateInfo) {
-        val density = resources.displayMetrics.density
-        val paddingPx = (24 * density).toInt()
-        val container = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            setPadding(paddingPx, (12 * density).toInt(), paddingPx, (8 * density).toInt())
-        }
-        val tvProgress = TextView(this).apply {
-            text = getString(R.string.update_downloading_progress, 0)
-        }
-        val progressIndicator = LinearProgressIndicator(this).apply {
-            max = 100
-            progress = 0
-            setPadding(0, (12 * density).toInt(), 0, 0)
-        }
-        container.addView(tvProgress)
-        container.addView(progressIndicator)
+        val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_update_progress, null)
+        val tvPercent = dialogView.findViewById<TextView>(R.id.tvUpdateProgressPercent)
+        val progressBar = dialogView.findViewById<LinearProgressIndicator>(R.id.progressUpdateBar)
 
         val progressDialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.update_downloading_title)
-            .setView(container)
+            .setView(dialogView)
             .setCancelable(false)
             .show()
 
@@ -461,8 +478,9 @@ class MainActivity : AppCompatActivity() {
             try {
                 val apkFile = AppUpdater.downloadApk(this@MainActivity, info.apkDownloadUrl) { percent ->
                     runOnUiThread {
-                        tvProgress.text = getString(R.string.update_downloading_progress, percent)
-                        progressIndicator.setProgress(percent, true)
+                        val clamped = percent.coerceIn(0, 100)
+                        tvPercent.text = getString(R.string.update_percent_format, clamped)
+                        progressBar.setProgress(clamped, true)
                     }
                 }
                 progressDialog.dismiss()
