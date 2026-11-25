@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LiveSub Translate</string>
+    <string name="status_ready">Sẵn sàng</string>
+    <string name="status_translating">Đang dịch</string>
+
+    <string name="hero_status_idle">Sẵn sàng dịch phim offline</string>
+    <string name="hero_status_running">Đang thu âm thanh trình duyệt</string>
+    <string name="audio_signal_label">Tín hiệu âm thanh</string>
+    <string name="live_preview_placeholder">Bản dịch tiếng Việt sẽ hiển thị tại đây…</string>
+
+    <string name="section_language">Ngôn ngữ phim</string>
+    <string name="lang_english">Anh</string>
+    <string name="lang_chinese">Trung</string>
+    <string name="lang_japanese">Nhật</string>
+    <string name="lang_russian">Nga</string>
+
+    <string name="model_checking">Đang kiểm tra dữ liệu…</string>
+    <string name="model_ready">Đã sẵn sàng nhận diện %1$s (Offline)</string>
+    <string name="model_missing">Chưa tải dữ liệu %1$s (~%2$d MB)</string>
+    <string name="btn_download_model">Tải dữ liệu %1$s</string>
+    <string name="btn_recheck_model">Kiểm tra lại dữ liệu</string>
+    <string name="download_complete">Tải dữ liệu hoàn tất</string>
+    <string name="download_error">Lỗi tải dữ liệu: %1$s</string>
+
+    <string name="section_output">Đầu ra &amp; Tùy chọn</string>
+    <string name="option_overlay_title">Phụ đề nổi (Overlay)</string>
+    <string name="option_overlay_desc">Hiển thị hộp phụ đề trên trình duyệt</string>
+    <string name="option_tts_title">Đọc tiếng Việt vào tai nghe (TTS)</string>
+    <string name="option_tts_desc">Phát giọng đọc tiếng Việt song song</string>
+    <string name="option_show_original_title">Hiển thị kèm câu gốc</string>
+    <string name="option_show_original_desc">Hiện câu gốc phía trên bản dịch</string>
+
+    <string name="btn_start_translate">Bắt đầu dịch phim</string>
+    <string name="btn_stop_translate">Dừng dịch</string>
+    <string name="btn_open_edge">Mở Edge Canary</string>
+
+    <string name="msg_download_first">Vui lòng tải dữ liệu %1$s trước khi bắt đầu</string>
+    <string name="msg_enable_one_output">Hãy bật ít nhất một đầu ra (Phụ đề nổi hoặc TTS)</string>
+    <string name="msg_need_audio_permission">Cần cấp quyền âm thanh để thu tiếng từ trình duyệt</string>
+    <string name="msg_need_overlay_permission">Cần cấp quyền Hiển thị trên ứng dụng khác để hiện phụ đề</string>
+    <string name="msg_edge_not_found">Không tìm thấy Edge Canary trên thiết bị</string>
+
+    <string name="app_version_format">Phiên bản %1$s</string>
+    <string name="btn_check_update">Kiểm tra cập nhật</string>
+    <string name="update_checking">Đang kiểm tra cập nhật…</string>
+    <string name="update_available_title">Có phiên bản mới %1$s</string>
+    <string name="update_now">Cập nhật ngay</string>
+    <string name="update_later">Để sau</string>
+    <string name="update_downloading_title">Đang tải bản cập nhật</string>
+    <string name="update_downloading_progress">Đang tải… %1$d%%</string>
+    <string name="update_up_to_date">Bạn đang dùng phiên bản mới nhất</string>
+    <string name="update_error">Không thể kiểm tra cập nhật: %1$s</string>
+</resources>
