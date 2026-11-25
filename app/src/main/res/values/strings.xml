@@ -28,6 +28,10 @@
     <string name="option_overlay_title">Phụ đề nổi</string>
     <string name="option_tts_title">Đọc vào tai nghe</string>
     <string name="option_show_original_title">Hiện kèm câu gốc</string>
+    <string name="option_google_live_title">Dùng Google Speech (Chuẩn nhất)</string>
+    <string name="google_live_package_title">Google Speech · %1$s</string>
+    <string name="google_live_ready">Sẵn sàng (Không cần tải)</string>
+    <string name="google_live_unsupported">Cần Android 13+ có Google Speech</string>
 
     <string name="btn_start_translate">Bắt đầu dịch</string>
     <string name="btn_stop_translate">Dừng dịch</string>

@@ -14,6 +14,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.speech.SpeechRecognizer
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.TextView
@@ -35,6 +36,7 @@ import com.livesub.translate.databinding.ActivityMainBinding
 import com.livesub.translate.engine.AppUpdater
 import com.livesub.translate.engine.ModelManager
 import com.livesub.translate.engine.UpdateInfo
+import com.livesub.translate.model.AsrMode
 import com.livesub.translate.model.FilmLanguage
 import com.livesub.translate.service.LiveTranslateService
 import kotlinx.coroutines.launch
@@ -44,6 +46,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var modelManager: ModelManager
     private var selectedLanguage = FilmLanguage.ENGLISH
+    private var selectedAsrMode = AsrMode.OFFLINE_SHERPA
+    private var isGoogleLiveSupported = false
     private var isDownloadingModel = false
 
     private val requestPermissionsLauncher = registerForActivityResult(
@@ -80,6 +84,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra(LiveTranslateService.EXTRA_ENABLE_OVERLAY, binding.switchOverlay.isChecked)
                 putExtra(LiveTranslateService.EXTRA_ENABLE_TTS, binding.switchTts.isChecked)
                 putExtra(LiveTranslateService.EXTRA_SHOW_ORIGINAL, binding.switchShowOriginal.isChecked)
+                putExtra(LiveTranslateService.EXTRA_ASR_MODE, selectedAsrMode.name)
             }
             ContextCompat.startForegroundService(this, serviceIntent)
             updateUiState(isRunning = true)
@@ -127,6 +132,10 @@ class MainActivity : AppCompatActivity() {
         applyEdgeToEdgeInsets()
 
         modelManager = ModelManager(this)
+        isGoogleLiveSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            SpeechRecognizer.isRecognitionAvailable(this)
+        selectedAsrMode = if (isGoogleLiveSupported) AsrMode.GOOGLE_LIVE else AsrMode.OFFLINE_SHERPA
+
         setupLanguageSelector()
         setupControls()
         setupVersionAndUpdater()
@@ -206,6 +215,26 @@ class MainActivity : AppCompatActivity() {
         binding.rowOverlay.setOnClickListener { binding.switchOverlay.toggle() }
         binding.rowTts.setOnClickListener { binding.switchTts.toggle() }
         binding.rowShowOriginal.setOnClickListener { binding.switchShowOriginal.toggle() }
+        binding.rowGoogleLive.setOnClickListener {
+            if (isGoogleLiveSupported) {
+                binding.switchGoogleLive.toggle()
+            } else {
+                Toast.makeText(this, R.string.google_live_unsupported, Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        binding.switchGoogleLive.isChecked = isGoogleLiveSupported
+        binding.switchGoogleLive.isEnabled = isGoogleLiveSupported
+        binding.switchGoogleLive.setOnCheckedChangeListener { _, isChecked ->
+            selectedAsrMode = if (isChecked && isGoogleLiveSupported) {
+                AsrMode.GOOGLE_LIVE
+            } else {
+                AsrMode.OFFLINE_SHERPA
+            }
+            if (!isDownloadingModel) {
+                refreshModelStatus()
+            }
+        }
 
         val outputListener = { _: View, _: Boolean ->
             if (!binding.switchShowOriginal.isChecked) {
@@ -226,16 +255,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshModelStatus() {
+        binding.progressModelCircle.visibility = View.GONE
+        binding.progressDownload.visibility = View.GONE
+        binding.tvDownloadPercent.visibility = View.GONE
+        binding.ivModelState.visibility = View.VISIBLE
+
+        if (selectedAsrMode == AsrMode.GOOGLE_LIVE) {
+            binding.tvModelTitle.text = getString(
+                R.string.google_live_package_title,
+                selectedLanguage.displayName
+            )
+            binding.tvModelStatus.text = getString(R.string.google_live_ready)
+            binding.ivModelState.setImageResource(R.drawable.ic_check_circle)
+            binding.cardModelIconBg.setCardBackgroundColor(
+                MaterialColors.getColor(binding.cardModelIconBg, com.google.android.material.R.attr.colorPrimaryContainer)
+            )
+            binding.ivModelState.imageTintList = ColorStateList.valueOf(
+                MaterialColors.getColor(binding.ivModelState, com.google.android.material.R.attr.colorOnPrimaryContainer)
+            )
+            binding.btnDownloadModel.visibility = View.GONE
+            return
+        }
+
         binding.tvModelTitle.text = getString(
             R.string.model_package_title,
             selectedLanguage.displayName,
             selectedLanguage.approxSizeMb
         )
         val ready = modelManager.isAsrModelReady(selectedLanguage)
-        binding.progressModelCircle.visibility = View.GONE
-        binding.progressDownload.visibility = View.GONE
-        binding.tvDownloadPercent.visibility = View.GONE
-        binding.ivModelState.visibility = View.VISIBLE
 
         if (ready) {
             binding.tvModelStatus.text = getString(R.string.model_ready_offline)
@@ -297,7 +344,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startLiveTranslateFlow() {
-        if (!modelManager.isAsrModelReady(selectedLanguage)) {
+        if (selectedAsrMode == AsrMode.OFFLINE_SHERPA && !modelManager.isAsrModelReady(selectedLanguage)) {
             Toast.makeText(
                 this,
                 getString(R.string.msg_download_first, selectedLanguage.displayName),

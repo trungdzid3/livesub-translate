@@ -17,15 +17,19 @@ import android.media.AudioPlaybackConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.speech.SpeechRecognizer
 import androidx.core.app.NotificationCompat
 import com.livesub.translate.R
+import com.livesub.translate.engine.GoogleSpeechPipeEngine
 import com.livesub.translate.engine.GoogleTranslator
 import com.livesub.translate.engine.ModelManager
 import com.livesub.translate.engine.StreamingAsrEngine
 import com.livesub.translate.engine.TtsSpeaker
+import com.livesub.translate.model.AsrMode
 import com.livesub.translate.model.FilmLanguage
 import com.livesub.translate.overlay.SubtitleOverlayManager
 import com.livesub.translate.ui.MainActivity
@@ -53,6 +57,7 @@ class LiveTranslateService : Service() {
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
         const val EXTRA_LANGUAGE = "extra_language"
+        const val EXTRA_ASR_MODE = "extra_asr_mode"
         const val EXTRA_ENABLE_OVERLAY = "extra_enable_overlay"
         const val EXTRA_ENABLE_TTS = "extra_enable_tts"
         const val EXTRA_SHOW_ORIGINAL = "extra_show_original"
@@ -84,6 +89,7 @@ class LiveTranslateService : Service() {
     private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
     private var audioRecord: AudioRecord? = null
     private var asrEngine: StreamingAsrEngine? = null
+    private var googleSpeechEngine: GoogleSpeechPipeEngine? = null
     private var translator: GoogleTranslator? = null
     private var overlayManager: SubtitleOverlayManager? = null
     private var ttsSpeaker: TtsSpeaker? = null
@@ -99,6 +105,7 @@ class LiveTranslateService : Service() {
     @Volatile
     private var lastPlaybackChangeMs = 0L
     private var currentLanguage = FilmLanguage.ENGLISH
+    private var currentAsrMode = AsrMode.GOOGLE_LIVE
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -137,6 +144,29 @@ class LiveTranslateService : Service() {
                 val langName = intent.getStringExtra(EXTRA_LANGUAGE) ?: FilmLanguage.ENGLISH.name
                 currentLanguage = runCatching { FilmLanguage.valueOf(langName) }
                     .getOrDefault(FilmLanguage.ENGLISH)
+
+                val defaultMode = if (
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    SpeechRecognizer.isRecognitionAvailable(this)
+                ) {
+                    AsrMode.GOOGLE_LIVE
+                } else {
+                    AsrMode.OFFLINE_SHERPA
+                }
+                val requestedModeName = intent.getStringExtra(EXTRA_ASR_MODE)
+                val requestedMode = requestedModeName?.let {
+                    runCatching { AsrMode.valueOf(it) }.getOrNull()
+                } ?: defaultMode
+                currentAsrMode = if (
+                    requestedMode == AsrMode.GOOGLE_LIVE &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    SpeechRecognizer.isRecognitionAvailable(this)
+                ) {
+                    AsrMode.GOOGLE_LIVE
+                } else {
+                    AsrMode.OFFLINE_SHERPA
+                }
+
                 enableOverlay = intent.getBooleanExtra(EXTRA_ENABLE_OVERLAY, true)
                 enableTts = intent.getBooleanExtra(EXTRA_ENABLE_TTS, true)
                 showOriginal = intent.getBooleanExtra(EXTRA_SHOW_ORIGINAL, true)
@@ -212,6 +242,9 @@ class LiveTranslateService : Service() {
             override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
                 needAsrReset = true
                 lastPlaybackChangeMs = System.currentTimeMillis()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    googleSpeechEngine?.restartPipe()
+                }
             }
         }
         playbackCallback = pbCallback
@@ -229,62 +262,93 @@ class LiveTranslateService : Service() {
             val finalTranslateChannel = Channel<String>(capacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
             val interimTranslateChannel = Channel<String>(capacity = Channel.CONFLATED)
 
+            var lastInterimNorm = ""
+            var lastInterimTime = 0L
+            var lastFinalNorm = ""
+            var lastFinalTime = 0L
+
+            fun handleRecognitionResult(text: String, isFinal: Boolean) {
+                val norm = text.trim().lowercase()
+                val now = System.currentTimeMillis()
+                if (isFinal) {
+                    lastInterimNorm = ""
+                    lastInterimTime = 0L
+                    val isDuplicateFinal = norm.isEmpty() ||
+                        (norm == lastFinalNorm && now - lastFinalTime < 4000L)
+                    if (isDuplicateFinal) return
+
+                    lastFinalNorm = norm
+                    lastFinalTime = now
+                    interimTranslateChannel.tryReceive()
+                    finalTranslateChannel.trySend(text)
+                } else {
+                    val isDupInterim = norm.isEmpty() ||
+                        norm == lastInterimNorm ||
+                        (norm == lastFinalNorm && now - lastFinalTime < 4000L)
+                    if (!isDupInterim && now - lastInterimTime >= INTERIM_DEBOUNCE_MS) {
+                        lastInterimNorm = norm
+                        lastInterimTime = now
+                        interimTranslateChannel.trySend(text)
+                    }
+                }
+            }
+
             try {
-                val modelDir = ModelManager(applicationContext).getModelDir(currentLanguage)
-                val streamingAsr = StreamingAsrEngine(modelDir)
-                asrEngine = streamingAsr
                 val googleTranslator = GoogleTranslator(currentLanguage)
                 translator = googleTranslator
+
+                val useGoogleLive = currentAsrMode == AsrMode.GOOGLE_LIVE &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+
+                val streamingAsr: StreamingAsrEngine?
+                val googleLiveEngine: GoogleSpeechPipeEngine?
+
+                if (useGoogleLive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    streamingAsr = null
+                    googleLiveEngine = GoogleSpeechPipeEngine(
+                        context = applicationContext,
+                        language = currentLanguage,
+                        onResult = { text, isFinal -> handleRecognitionResult(text, isFinal) },
+                        onFatalUnsupported = { reason ->
+                            updateNotification(reason)
+                            stopAll()
+                            stopSelf()
+                        }
+                    ).also {
+                        googleSpeechEngine = it
+                        it.start()
+                    }
+                } else {
+                    googleLiveEngine = null
+                    val modelDir = ModelManager(applicationContext).getModelDir(currentLanguage)
+                    streamingAsr = StreamingAsrEngine(modelDir).also { asrEngine = it }
+                }
 
                 var recorder = createAudioRecord(projection)
                 audioRecord = recorder
                 recorder.startRecording()
 
-                updateNotification("Đang dịch live (${currentLanguage.displayName} -> Việt)")
+                val modeLabel = if (useGoogleLive) "Google Live" else "Offline AI"
+                updateNotification("Đang dịch $modeLabel (${currentLanguage.displayName} -> Việt)")
 
-                // Luồng 2: Nhận diện streaming liên tục, reset sạch khi có sự kiện tua/đổi playback
-                val asrJob = launch(Dispatchers.Default) {
-                    var lastInterimNorm = ""
-                    var lastInterimTime = 0L
-                    var lastFinalNorm = ""
-                    var lastFinalTime = 0L
-
-                    for (chunk in rawAudioChannel) {
-                        if (needAsrReset) {
-                            needAsrReset = false
-                            streamingAsr.resetStream()
-                            lastInterimNorm = ""
-                            lastInterimTime = 0L
-                            interimTranslateChannel.tryReceive()
-                        }
-
-                        val update = streamingAsr.processAudio(chunk) ?: continue
-                        val norm = update.text.trim().lowercase()
-                        val now = System.currentTimeMillis()
-
-                        if (update.isFinal) {
-                            lastInterimNorm = ""
-                            lastInterimTime = 0L
-
-                            val isDuplicateFinal = norm.isEmpty() ||
-                                (norm == lastFinalNorm && now - lastFinalTime < 4000L)
-                            if (isDuplicateFinal) continue
-
-                            lastFinalNorm = norm
-                            lastFinalTime = now
-                            interimTranslateChannel.tryReceive()
-                            finalTranslateChannel.trySend(update.text)
-                        } else {
-                            val isDupInterim = norm.isEmpty() ||
-                                norm == lastInterimNorm ||
-                                (norm == lastFinalNorm && now - lastFinalTime < 4000L)
-                            if (!isDupInterim && now - lastInterimTime >= INTERIM_DEBOUNCE_MS) {
-                                lastInterimNorm = norm
-                                lastInterimTime = now
-                                interimTranslateChannel.trySend(update.text)
+                // Luồng 2 (chỉ dùng cho Offline Sherpa-ONNX): Nhận diện streaming từ rawAudioChannel
+                val asrJob = if (streamingAsr != null) {
+                    launch(Dispatchers.Default) {
+                        for (chunk in rawAudioChannel) {
+                            if (needAsrReset) {
+                                needAsrReset = false
+                                streamingAsr.resetStream()
+                                lastInterimNorm = ""
+                                lastInterimTime = 0L
+                                interimTranslateChannel.tryReceive()
                             }
+
+                            val update = streamingAsr.processAudio(chunk) ?: continue
+                            handleRecognitionResult(update.text, update.isFinal)
                         }
                     }
+                } else {
+                    null
                 }
 
                 // Luồng 3: Dịch ưu tiên câu đã chốt (final) trước interim; bọc try-catch để không bao giờ chết luồng
@@ -352,6 +416,13 @@ class LiveTranslateService : Service() {
                 var zeroReadStartMs = 0L
                 var zeroPeakAfterChangeStartMs = 0L
 
+                fun resetActiveAsr() {
+                    streamingAsr?.resetStream()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        googleLiveEngine?.restartPipe()
+                    }
+                }
+
                 while (isActive) {
                     val isRecording = recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING
                     val read = if (isRecording) recorder.read(chunkShorts, 0, chunkShorts.size) else -1
@@ -367,7 +438,7 @@ class LiveTranslateService : Service() {
                         recorder = createAudioRecord(projection)
                         audioRecord = recorder
                         recorder.startRecording()
-                        streamingAsr.resetStream()
+                        resetActiveAsr()
                         zeroReadStartMs = 0L
                         zeroPeakAfterChangeStartMs = 0L
                         continue
@@ -387,7 +458,7 @@ class LiveTranslateService : Service() {
                             recorder = createAudioRecord(projection)
                             audioRecord = recorder
                             recorder.startRecording()
-                            streamingAsr.resetStream()
+                            resetActiveAsr()
                             zeroReadStartMs = 0L
                         }
                         delay(20L)
@@ -395,12 +466,12 @@ class LiveTranslateService : Service() {
                     }
 
                     zeroReadStartMs = 0L
-                    val floatSlice = FloatArray(read)
                     var sumSq = 0.0
                     var maxPeak = 0f
+                    val floatSlice = if (streamingAsr != null) FloatArray(read) else null
                     for (i in 0 until read) {
                         val v = chunkShorts[i] / 32768.0f
-                        floatSlice[i] = v
+                        if (floatSlice != null) floatSlice[i] = v
                         sumSq += v * v
                         val a = abs(v)
                         if (a > maxPeak) maxPeak = a
@@ -422,7 +493,7 @@ class LiveTranslateService : Service() {
                             recorder = createAudioRecord(projection)
                             audioRecord = recorder
                             recorder.startRecording()
-                            streamingAsr.resetStream()
+                            resetActiveAsr()
                             zeroPeakAfterChangeStartMs = 0L
                             lastPlaybackChangeMs = 0L
                             continue
@@ -431,7 +502,11 @@ class LiveTranslateService : Service() {
                         zeroPeakAfterChangeStartMs = 0L
                     }
 
-                    rawAudioChannel.trySend(floatSlice)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && googleLiveEngine != null) {
+                        googleLiveEngine.writePcm16(chunkShorts, read)
+                    } else if (floatSlice != null) {
+                        rawAudioChannel.trySend(floatSlice)
+                    }
 
                     if (now - lastLevelBroadcast > 200L) {
                         lastLevelBroadcast = now
@@ -444,7 +519,7 @@ class LiveTranslateService : Service() {
                 rawAudioChannel.close()
                 finalTranslateChannel.close()
                 interimTranslateChannel.close()
-                asrJob.cancel()
+                asrJob?.cancel()
                 translateJob.cancel()
             } catch (e: Exception) {
                 updateNotification("Lỗi: ${e.message ?: "Không thể thu âm thanh"}")
@@ -474,6 +549,11 @@ class LiveTranslateService : Service() {
             audioRecord?.release()
         }
         audioRecord = null
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            runCatching { googleSpeechEngine?.release() }
+        }
+        googleSpeechEngine = null
 
         runCatching { asrEngine?.release() }
         asrEngine = null
