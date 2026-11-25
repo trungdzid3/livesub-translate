@@ -11,7 +11,9 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioPlaybackConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -34,9 +36,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 class LiveTranslateService : Service() {
@@ -63,6 +67,7 @@ class LiveTranslateService : Service() {
         private const val CHANNEL_ID = "live_translate_channel"
         private const val NOTIFICATION_ID = 1001
         private const val INTERIM_DEBOUNCE_MS = 350L
+        private const val MAX_AUDIO_RESTART_ATTEMPTS = 5
 
         @Volatile
         var isRunning: Boolean = false
@@ -74,6 +79,9 @@ class LiveTranslateService : Service() {
     private var captureJob: Job? = null
 
     private var mediaProjection: MediaProjection? = null
+    private var projectionCallback: MediaProjection.Callback? = null
+    private var audioManager: AudioManager? = null
+    private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
     private var audioRecord: AudioRecord? = null
     private var asrEngine: StreamingAsrEngine? = null
     private var translator: GoogleTranslator? = null
@@ -86,6 +94,10 @@ class LiveTranslateService : Service() {
     private var enableTts = true
     @Volatile
     private var showOriginal = true
+    @Volatile
+    private var needAsrReset = false
+    @Volatile
+    private var lastPlaybackChangeMs = 0L
     private var currentLanguage = FilmLanguage.ENGLISH
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -145,14 +157,65 @@ class LiveTranslateService : Service() {
     }
 
     @SuppressLint("MissingPermission")
+    private fun createAudioRecord(projection: MediaProjection): AudioRecord {
+        val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
+            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .excludeUid(android.os.Process.myUid())
+            .build()
+
+        val sampleRate = 16000
+        val audioFormat = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setSampleRate(sampleRate)
+            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+            .build()
+
+        val minBuf = AudioRecord.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val bufferSize = maxOf(minBuf * 4, 32000)
+
+        return AudioRecord.Builder()
+            .setAudioFormat(audioFormat)
+            .setBufferSizeInBytes(bufferSize)
+            .setAudioPlaybackCaptureConfig(captureConfig)
+            .build()
+    }
+
     private fun startPipeline(resultCode: Int, resultData: Intent) {
         stopAll(keepForeground = true)
         isRunning = true
+        needAsrReset = false
+        lastPlaybackChangeMs = 0L
         broadcastStatus(running = true)
 
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection = projectionManager.getMediaProjection(resultCode, resultData)
         mediaProjection = projection
+
+        val projCallback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                stopAll()
+                stopSelf()
+            }
+        }
+        projectionCallback = projCallback
+        projection.registerCallback(projCallback, mainHandler)
+
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager = am
+        val pbCallback = object : AudioManager.AudioPlaybackCallback() {
+            override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
+                needAsrReset = true
+                lastPlaybackChangeMs = System.currentTimeMillis()
+            }
+        }
+        playbackCallback = pbCallback
+        am.registerAudioPlaybackCallback(pbCallback, mainHandler)
 
         val overlay = SubtitleOverlayManager(this)
         overlayManager = overlay
@@ -173,38 +236,13 @@ class LiveTranslateService : Service() {
                 val googleTranslator = GoogleTranslator(currentLanguage)
                 translator = googleTranslator
 
-                val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .excludeUid(android.os.Process.myUid())
-                    .build()
-
-                val sampleRate = 16000
-                val audioFormat = AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                    .build()
-
-                val minBuf = AudioRecord.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                val bufferSize = maxOf(minBuf * 4, 32000)
-
-                val recorder = AudioRecord.Builder()
-                    .setAudioFormat(audioFormat)
-                    .setBufferSizeInBytes(bufferSize)
-                    .setAudioPlaybackCaptureConfig(captureConfig)
-                    .build()
+                var recorder = createAudioRecord(projection)
                 audioRecord = recorder
                 recorder.startRecording()
 
                 updateNotification("Đang dịch live (${currentLanguage.displayName} -> Việt)")
 
-                // Luồng 2: Nhận diện streaming liên tục, giữ nguyên mạch câu cho tới khi endpoint + chống lặp
+                // Luồng 2: Nhận diện streaming liên tục, reset sạch khi có sự kiện tua/đổi playback
                 val asrJob = launch(Dispatchers.Default) {
                     var lastInterimNorm = ""
                     var lastInterimTime = 0L
@@ -212,6 +250,14 @@ class LiveTranslateService : Service() {
                     var lastFinalTime = 0L
 
                     for (chunk in rawAudioChannel) {
+                        if (needAsrReset) {
+                            needAsrReset = false
+                            streamingAsr.resetStream()
+                            lastInterimNorm = ""
+                            lastInterimTime = 0L
+                            interimTranslateChannel.tryReceive()
+                        }
+
                         val update = streamingAsr.processAudio(chunk) ?: continue
                         val norm = update.text.trim().lowercase()
                         val now = System.currentTimeMillis()
@@ -226,7 +272,6 @@ class LiveTranslateService : Service() {
 
                             lastFinalNorm = norm
                             lastFinalTime = now
-                            // Xả interim cũ đang chờ dịch để tránh đè ngược lên câu đã chốt
                             interimTranslateChannel.tryReceive()
                             finalTranslateChannel.trySend(update.text)
                         } else {
@@ -242,7 +287,7 @@ class LiveTranslateService : Service() {
                     }
                 }
 
-                // Luồng 3: Dịch ưu tiên câu đã chốt (final) trước interim; chỉ đọc TTS khi chốt câu
+                // Luồng 3: Dịch ưu tiên câu đã chốt (final) trước interim; bọc try-catch để không bao giờ chết luồng
                 val translateJob = launch(Dispatchers.IO) {
                     var lastFinalDisplayTime = 0L
                     var lastPublishedOriginal = ""
@@ -255,12 +300,15 @@ class LiveTranslateService : Service() {
                         }
 
                         val normalizedOriginal = googleTranslator.normalizeCase(textToTranslate)
-                        val translated = googleTranslator.translate(normalizedOriginal)
+                        val translated = try {
+                            googleTranslator.translate(normalizedOriginal)
+                        } catch (_: Exception) {
+                            ""
+                        }
                         if (translated.isBlank()) continue
 
                         val now = System.currentTimeMillis()
                         if (!isFinal && now - lastFinalDisplayTime < 300L) {
-                            // Bỏ qua interim bị trễ ngay sau khi vừa chốt câu
                             continue
                         }
                         if (isFinal && normalizedOriginal.equals(lastPublishedOriginal, ignoreCase = true) && lastPublishedFinal && now - lastFinalDisplayTime < 4000L) {
@@ -297,29 +345,99 @@ class LiveTranslateService : Service() {
                     }
                 }
 
-                // Luồng 1 (Producer): Đọc AudioRecord liên tục 16kHz Mono, không bao giờ block
+                // Luồng 1 (Producer): Đọc AudioRecord liên tục 16kHz Mono, tự phục hồi khi seek làm treo AudioRecord
                 val chunkShorts = ShortArray(1024) // 64ms mỗi chunk
                 var lastLevelBroadcast = 0L
+                var consecutiveRestartAttempts = 0
+                var zeroReadStartMs = 0L
+                var zeroPeakAfterChangeStartMs = 0L
 
-                while (isActive && recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    val read = recorder.read(chunkShorts, 0, chunkShorts.size)
-                    if (read > 0) {
-                        val floatSlice = FloatArray(read)
-                        var sumSq = 0.0
-                        for (i in 0 until read) {
-                            val v = chunkShorts[i] / 32768.0f
-                            floatSlice[i] = v
-                            sumSq += v * v
-                        }
-                        rawAudioChannel.trySend(floatSlice)
+                while (isActive) {
+                    val isRecording = recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING
+                    val read = if (isRecording) recorder.read(chunkShorts, 0, chunkShorts.size) else -1
 
-                        val now = System.currentTimeMillis()
-                        if (now - lastLevelBroadcast > 200L) {
-                            lastLevelBroadcast = now
-                            val rms = sqrt(sumSq / read).toFloat()
-                            val levelPct = (rms * 400f).toInt().coerceIn(0, 100)
-                            broadcastAudioLevel(levelPct)
+                    if (!isRecording || read < 0) {
+                        consecutiveRestartAttempts++
+                        if (consecutiveRestartAttempts > MAX_AUDIO_RESTART_ATTEMPTS) break
+                        delay(200L)
+                        runCatching {
+                            recorder.stop()
+                            recorder.release()
                         }
+                        recorder = createAudioRecord(projection)
+                        audioRecord = recorder
+                        recorder.startRecording()
+                        streamingAsr.resetStream()
+                        zeroReadStartMs = 0L
+                        zeroPeakAfterChangeStartMs = 0L
+                        continue
+                    }
+
+                    val now = System.currentTimeMillis()
+                    if (read == 0) {
+                        if (zeroReadStartMs == 0L) zeroReadStartMs = now
+                        if (now - zeroReadStartMs >= 2000L) {
+                            consecutiveRestartAttempts++
+                            if (consecutiveRestartAttempts > MAX_AUDIO_RESTART_ATTEMPTS) break
+                            runCatching {
+                                recorder.stop()
+                                recorder.release()
+                            }
+                            delay(200L)
+                            recorder = createAudioRecord(projection)
+                            audioRecord = recorder
+                            recorder.startRecording()
+                            streamingAsr.resetStream()
+                            zeroReadStartMs = 0L
+                        }
+                        delay(20L)
+                        continue
+                    }
+
+                    zeroReadStartMs = 0L
+                    val floatSlice = FloatArray(read)
+                    var sumSq = 0.0
+                    var maxPeak = 0f
+                    for (i in 0 until read) {
+                        val v = chunkShorts[i] / 32768.0f
+                        floatSlice[i] = v
+                        sumSq += v * v
+                        val a = abs(v)
+                        if (a > maxPeak) maxPeak = a
+                    }
+
+                    if (maxPeak > 0f) {
+                        consecutiveRestartAttempts = 0
+                        zeroPeakAfterChangeStartMs = 0L
+                    } else if (lastPlaybackChangeMs > 0L && now - lastPlaybackChangeMs in 100L..5000L) {
+                        if (zeroPeakAfterChangeStartMs == 0L) zeroPeakAfterChangeStartMs = now
+                        if (now - zeroPeakAfterChangeStartMs >= 1500L) {
+                            consecutiveRestartAttempts++
+                            if (consecutiveRestartAttempts > MAX_AUDIO_RESTART_ATTEMPTS) break
+                            runCatching {
+                                recorder.stop()
+                                recorder.release()
+                            }
+                            delay(200L)
+                            recorder = createAudioRecord(projection)
+                            audioRecord = recorder
+                            recorder.startRecording()
+                            streamingAsr.resetStream()
+                            zeroPeakAfterChangeStartMs = 0L
+                            lastPlaybackChangeMs = 0L
+                            continue
+                        }
+                    } else {
+                        zeroPeakAfterChangeStartMs = 0L
+                    }
+
+                    rawAudioChannel.trySend(floatSlice)
+
+                    if (now - lastLevelBroadcast > 200L) {
+                        lastLevelBroadcast = now
+                        val rms = sqrt(sumSq / read).toFloat()
+                        val levelPct = (rms * 400f).toInt().coerceIn(0, 100)
+                        broadcastAudioLevel(levelPct)
                     }
                 }
 
@@ -345,6 +463,12 @@ class LiveTranslateService : Service() {
         captureJob?.cancel()
         captureJob = null
 
+        playbackCallback?.let { cb ->
+            runCatching { audioManager?.unregisterAudioPlaybackCallback(cb) }
+        }
+        playbackCallback = null
+        audioManager = null
+
         runCatching {
             audioRecord?.stop()
             audioRecord?.release()
@@ -365,6 +489,11 @@ class LiveTranslateService : Service() {
 
         runCatching { ttsSpeaker?.release() }
         ttsSpeaker = null
+
+        projectionCallback?.let { cb ->
+            runCatching { mediaProjection?.unregisterCallback(cb) }
+        }
+        projectionCallback = null
 
         runCatching { mediaProjection?.stop() }
         mediaProjection = null

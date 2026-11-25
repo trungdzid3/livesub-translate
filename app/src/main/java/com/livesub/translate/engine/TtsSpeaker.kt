@@ -2,8 +2,6 @@ package com.livesub.translate.engine
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.util.Locale
@@ -11,7 +9,6 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class TtsSpeaker(context: Context) {
 
-    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var tts: TextToSpeech? = null
     @Volatile
     private var isReady = false
@@ -24,12 +21,6 @@ class TtsSpeaker(context: Context) {
         AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-    }
-
-    private val focusRequest: AudioFocusRequest by lazy {
-        AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-            .setAudioAttributes(ttsAudioAttributes)
             .build()
     }
 
@@ -47,7 +38,6 @@ class TtsSpeaker(context: Context) {
                         override fun onDone(utteranceId: String?) {
                             if (pendingQueueCount.decrementAndGet() <= 0) {
                                 pendingQueueCount.set(0)
-                                audioManager.abandonAudioFocusRequest(focusRequest)
                             }
                         }
 
@@ -55,7 +45,6 @@ class TtsSpeaker(context: Context) {
                         override fun onError(utteranceId: String?) {
                             if (pendingQueueCount.decrementAndGet() <= 0) {
                                 pendingQueueCount.set(0)
-                                audioManager.abandonAudioFocusRequest(focusRequest)
                             }
                         }
                     })
@@ -86,13 +75,11 @@ class TtsSpeaker(context: Context) {
             TextToSpeech.QUEUE_ADD
         }
 
-        audioManager.requestAudioFocus(focusRequest)
         val id = "sub_${now}"
         val result = engine.speak(text, queueMode, null, id)
         if (result == TextToSpeech.ERROR) {
             if (pendingQueueCount.decrementAndGet() <= 0) {
                 pendingQueueCount.set(0)
-                audioManager.abandonAudioFocusRequest(focusRequest)
             }
         }
     }
@@ -100,7 +87,6 @@ class TtsSpeaker(context: Context) {
     fun stopSpeaking() {
         pendingQueueCount.set(0)
         runCatching { tts?.stop() }
-        runCatching { audioManager.abandonAudioFocusRequest(focusRequest) }
     }
 
     fun release() {

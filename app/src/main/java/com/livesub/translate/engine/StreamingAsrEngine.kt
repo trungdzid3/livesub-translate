@@ -18,13 +18,14 @@ data class AsrUpdate(
 
 /**
  * Engine nhận diện giọng nói streaming liên tục bằng Sherpa-ONNX OnlineRecognizer.
- * Giữ ngữ cảnh câu liên tục, cập nhật interim từng từ và chỉ reset khi endpoint.
+ * Giữ ngữ cảnh câu liên tục, cập nhật interim từng từ và chỉ reset khi endpoint hoặc im lặng sau tua phim.
  */
 class StreamingAsrEngine(private val modelDir: File) {
 
     private val recognizer: OnlineRecognizer
     private val stream: OnlineStream
     private var smoothedGain = 1.0f
+    private var consecutiveSilenceMs = 0L
 
     init {
         val tokensFile = File(modelDir, "tokens.txt")
@@ -86,9 +87,31 @@ class StreamingAsrEngine(private val modelDir: File) {
             ?: throw IllegalStateException("Không tìm thấy file $prefix*.onnx trong ${modelDir.name}")
     }
 
+    @Synchronized
+    fun resetStream() {
+        runCatching { recognizer.reset(stream) }
+        smoothedGain = 1.0f
+        consecutiveSilenceMs = 0L
+    }
+
+    @Synchronized
     fun processAudio(samples: FloatArray): AsrUpdate? {
         if (samples.isEmpty()) return null
-        val normalized = applySoftAgc(samples)
+
+        var maxPeak = 0f
+        for (s in samples) {
+            val a = abs(s)
+            if (a > maxPeak) maxPeak = a
+        }
+
+        val chunkMs = (samples.size * 1000L) / 16000L
+        if (maxPeak < 0.008f) {
+            consecutiveSilenceMs += chunkMs
+        } else {
+            consecutiveSilenceMs = 0L
+        }
+
+        val normalized = applySoftAgc(samples, maxPeak)
         stream.acceptWaveform(normalized, 16000)
 
         while (recognizer.isReady(stream)) {
@@ -97,23 +120,23 @@ class StreamingAsrEngine(private val modelDir: File) {
 
         val rawText = recognizer.getResult(stream).text
         val text = filterRepetitionHallucination(cleanText(rawText))
-        val endpointReached = recognizer.isEndpoint(stream) || text.length > 120
+        val endpointReached = recognizer.isEndpoint(stream) ||
+            text.length > 120 ||
+            consecutiveSilenceMs >= 1800L
 
         if (endpointReached) {
             recognizer.reset(stream)
+            if (consecutiveSilenceMs >= 1800L) {
+                smoothedGain = 1.0f
+                consecutiveSilenceMs = 0L
+            }
             return if (text.isNotBlank()) AsrUpdate(text = text, isFinal = true) else null
         }
 
         return if (text.isNotBlank()) AsrUpdate(text = text, isFinal = false) else null
     }
 
-    private fun applySoftAgc(samples: FloatArray): FloatArray {
-        var maxPeak = 0f
-        for (s in samples) {
-            val a = abs(s)
-            if (a > maxPeak) maxPeak = a
-        }
-
+    private fun applySoftAgc(samples: FloatArray, maxPeak: Float): FloatArray {
         // Không khuếch đại nhiễu nền/im lặng dưới ngưỡng 0.015f để tránh ảo giác lặp từ
         val targetGain = if (maxPeak < 0.015f) {
             1.0f
@@ -144,7 +167,6 @@ class StreamingAsrEngine(private val modelDir: File) {
         if (text.isBlank()) return ""
         val words = text.split(" ").filter { it.isNotBlank() }
         if (words.size >= 3) {
-            // Thu gọn từ lặp liên tiếp quá 2 lần (vd: "no no no no" -> "no")
             val collapsed = mutableListOf<String>()
             var repeatCount = 1
             for (i in words.indices) {
@@ -158,7 +180,6 @@ class StreamingAsrEngine(private val modelDir: File) {
                     collapsed.add(words[i])
                 }
             }
-            // Nếu toàn bộ câu chỉ là 1 từ lặp lại nhiều lần -> bỏ qua
             if (collapsed.size == 2 && collapsed[0].equals(collapsed[1], ignoreCase = true) && words.size >= 4) {
                 return ""
             }
@@ -167,6 +188,7 @@ class StreamingAsrEngine(private val modelDir: File) {
         return text
     }
 
+    @Synchronized
     fun release() {
         runCatching { stream.release() }
         runCatching { recognizer.release() }
