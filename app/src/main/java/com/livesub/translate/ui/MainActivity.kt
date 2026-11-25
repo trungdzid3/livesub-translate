@@ -230,20 +230,17 @@ class MainActivity : AppCompatActivity() {
             binding.ivModelState.imageTintList = ColorStateList.valueOf(
                 MaterialColors.getColor(binding.ivModelState, com.google.android.material.R.attr.colorPrimary)
             )
-            binding.btnDownloadModel.text = getString(R.string.btn_recheck_model)
-            binding.btnDownloadModel.alpha = 0.78f
+            binding.btnDownloadModel.visibility = View.GONE
         } else {
             binding.tvModelStatus.text = getString(
                 R.string.model_missing,
-                selectedLanguage.displayName,
                 selectedLanguage.approxSizeMb
             )
             binding.ivModelState.setImageResource(R.drawable.ic_download)
             binding.ivModelState.imageTintList = ColorStateList.valueOf(
                 MaterialColors.getColor(binding.ivModelState, com.google.android.material.R.attr.colorOnSurfaceVariant)
             )
-            binding.btnDownloadModel.text = getString(R.string.btn_download_model, selectedLanguage.displayName)
-            binding.btnDownloadModel.alpha = 1.0f
+            binding.btnDownloadModel.visibility = View.VISIBLE
         }
     }
 
@@ -333,7 +330,6 @@ class MainActivity : AppCompatActivity() {
     private fun updateUiState(isRunning: Boolean) {
         if (isRunning) {
             binding.tvStatusBadge.text = getString(R.string.status_translating)
-            binding.tvHeroStatusTitle.text = getString(R.string.hero_status_running)
 
             val containerBg = MaterialColors.getColor(binding.badgeStatusCard, com.google.android.material.R.attr.colorPrimaryContainer)
             val onContainer = MaterialColors.getColor(binding.tvStatusBadge, com.google.android.material.R.attr.colorOnPrimaryContainer)
@@ -350,7 +346,6 @@ class MainActivity : AppCompatActivity() {
             binding.btnToggleService.iconTint = ColorStateList.valueOf(onErrorColor)
         } else {
             binding.tvStatusBadge.text = getString(R.string.status_ready)
-            binding.tvHeroStatusTitle.text = getString(R.string.hero_status_idle)
 
             val surfaceHigh = MaterialColors.getColor(binding.badgeStatusCard, com.google.android.material.R.attr.colorSurfaceContainerHigh)
             val onSurfaceVar = MaterialColors.getColor(binding.tvStatusBadge, com.google.android.material.R.attr.colorOnSurfaceVariant)
@@ -371,13 +366,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupVersionAndUpdater() {
-        val currentVersion = getCurrentVersionName()
-        binding.tvAppVersion.text = getString(R.string.app_version_format, currentVersion)
-
         binding.btnCheckUpdate.setOnClickListener {
             checkForUpdates(silent = false)
         }
-
         checkForUpdates(silent = true)
     }
 
@@ -396,17 +387,22 @@ class MainActivity : AppCompatActivity() {
     private fun checkForUpdates(silent: Boolean) {
         if (!silent) {
             binding.btnCheckUpdate.isEnabled = false
-            binding.btnCheckUpdate.text = getString(R.string.update_checking)
+            binding.btnCheckUpdate.alpha = 0.5f
         }
 
         lifecycleScope.launch {
             try {
-                val updateInfo = AppUpdater.checkForUpdate(getCurrentVersionName())
+                val currentVer = getCurrentVersionName()
+                val updateInfo = AppUpdater.checkForUpdate(currentVer)
                 if (isFinishing || isDestroyed) return@launch
                 if (updateInfo != null) {
                     showUpdateDialog(updateInfo)
                 } else if (!silent) {
-                    Toast.makeText(this@MainActivity, R.string.update_up_to_date, Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this@MainActivity,
+                        getString(R.string.update_up_to_date, currentVer),
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             } catch (e: Exception) {
                 if (!silent && !isFinishing && !isDestroyed) {
@@ -419,7 +415,7 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 if (!silent && !isFinishing && !isDestroyed) {
                     binding.btnCheckUpdate.isEnabled = true
-                    binding.btnCheckUpdate.text = getString(R.string.btn_check_update)
+                    binding.btnCheckUpdate.alpha = 1.0f
                 }
             }
         }

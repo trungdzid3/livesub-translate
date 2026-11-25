@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <color name="ic_launcher_bg">#E4ECFF</color>
+
     <!-- M3 Light Palette -->
     <color name="md_theme_light_primary">#1B5EBF</color>
     <color name="md_theme_light_onPrimary">#FFFFFF</color>
