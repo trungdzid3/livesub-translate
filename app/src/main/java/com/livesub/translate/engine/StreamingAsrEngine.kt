@@ -95,7 +95,8 @@ class StreamingAsrEngine(private val modelDir: File) {
             recognizer.decode(stream)
         }
 
-        val text = cleanText(recognizer.getResult(stream).text)
+        val rawText = recognizer.getResult(stream).text
+        val text = filterRepetitionHallucination(cleanText(rawText))
         val endpointReached = recognizer.isEndpoint(stream) || text.length > 120
 
         if (endpointReached) {
@@ -113,10 +114,11 @@ class StreamingAsrEngine(private val modelDir: File) {
             if (a > maxPeak) maxPeak = a
         }
 
-        val targetGain = if (maxPeak < 0.006f) {
+        // Không khuếch đại nhiễu nền/im lặng dưới ngưỡng 0.015f để tránh ảo giác lặp từ
+        val targetGain = if (maxPeak < 0.015f) {
             1.0f
         } else {
-            (0.70f / maxPeak).coerceIn(1.0f, 5.0f)
+            (0.70f / maxPeak).coerceIn(1.0f, 4.5f)
         }
         smoothedGain = smoothedGain * 0.75f + targetGain * 0.25f
 
@@ -133,6 +135,36 @@ class StreamingAsrEngine(private val modelDir: File) {
         return raw.replace(Regex("<\\|[^|]+\\|>"), "")
             .replace(Regex("\\s+"), " ")
             .trim()
+    }
+
+    /**
+     * Lọc ảo giác lặp từ/cụm từ khi nhạc nền hoặc im lặng kéo dài (vd: "the the the" hoặc lặp cụm >= 3 lần).
+     */
+    private fun filterRepetitionHallucination(text: String): String {
+        if (text.isBlank()) return ""
+        val words = text.split(" ").filter { it.isNotBlank() }
+        if (words.size >= 3) {
+            // Thu gọn từ lặp liên tiếp quá 2 lần (vd: "no no no no" -> "no")
+            val collapsed = mutableListOf<String>()
+            var repeatCount = 1
+            for (i in words.indices) {
+                if (i > 0 && words[i].equals(words[i - 1], ignoreCase = true)) {
+                    repeatCount++
+                    if (repeatCount <= 2) {
+                        collapsed.add(words[i])
+                    }
+                } else {
+                    repeatCount = 1
+                    collapsed.add(words[i])
+                }
+            }
+            // Nếu toàn bộ câu chỉ là 1 từ lặp lại nhiều lần -> bỏ qua
+            if (collapsed.size == 2 && collapsed[0].equals(collapsed[1], ignoreCase = true) && words.size >= 4) {
+                return ""
+            }
+            return collapsed.joinToString(" ")
+        }
+        return text
     }
 
     fun release() {

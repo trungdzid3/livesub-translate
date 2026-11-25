@@ -177,6 +177,7 @@ class LiveTranslateService : Service() {
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                     .addMatchingUsage(AudioAttributes.USAGE_GAME)
                     .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .excludeUid(android.os.Process.myUid())
                     .build()
 
                 val sampleRate = 16000
@@ -203,21 +204,37 @@ class LiveTranslateService : Service() {
 
                 updateNotification("Đang dịch live (${currentLanguage.displayName} -> Việt)")
 
-                // Luồng 2: Nhận diện streaming liên tục, giữ nguyên mạch câu cho tới khi endpoint
+                // Luồng 2: Nhận diện streaming liên tục, giữ nguyên mạch câu cho tới khi endpoint + chống lặp
                 val asrJob = launch(Dispatchers.Default) {
-                    var lastInterimText = ""
+                    var lastInterimNorm = ""
                     var lastInterimTime = 0L
+                    var lastFinalNorm = ""
+                    var lastFinalTime = 0L
 
                     for (chunk in rawAudioChannel) {
                         val update = streamingAsr.processAudio(chunk) ?: continue
+                        val norm = update.text.trim().lowercase()
+                        val now = System.currentTimeMillis()
+
                         if (update.isFinal) {
-                            lastInterimText = ""
+                            lastInterimNorm = ""
                             lastInterimTime = 0L
+
+                            val isDuplicateFinal = norm.isEmpty() ||
+                                (norm == lastFinalNorm && now - lastFinalTime < 4000L)
+                            if (isDuplicateFinal) continue
+
+                            lastFinalNorm = norm
+                            lastFinalTime = now
+                            // Xả interim cũ đang chờ dịch để tránh đè ngược lên câu đã chốt
+                            interimTranslateChannel.tryReceive()
                             finalTranslateChannel.trySend(update.text)
                         } else {
-                            val now = System.currentTimeMillis()
-                            if (update.text != lastInterimText && now - lastInterimTime >= INTERIM_DEBOUNCE_MS) {
-                                lastInterimText = update.text
+                            val isDupInterim = norm.isEmpty() ||
+                                norm == lastInterimNorm ||
+                                (norm == lastFinalNorm && now - lastFinalTime < 4000L)
+                            if (!isDupInterim && now - lastInterimTime >= INTERIM_DEBOUNCE_MS) {
+                                lastInterimNorm = norm
                                 lastInterimTime = now
                                 interimTranslateChannel.trySend(update.text)
                             }
@@ -227,6 +244,10 @@ class LiveTranslateService : Service() {
 
                 // Luồng 3: Dịch ưu tiên câu đã chốt (final) trước interim; chỉ đọc TTS khi chốt câu
                 val translateJob = launch(Dispatchers.IO) {
+                    var lastFinalDisplayTime = 0L
+                    var lastPublishedOriginal = ""
+                    var lastPublishedFinal = false
+
                     while (isActive) {
                         val (textToTranslate, isFinal) = select<Pair<String, Boolean>> {
                             finalTranslateChannel.onReceive { it to true }
@@ -236,6 +257,21 @@ class LiveTranslateService : Service() {
                         val normalizedOriginal = googleTranslator.normalizeCase(textToTranslate)
                         val translated = googleTranslator.translate(normalizedOriginal)
                         if (translated.isBlank()) continue
+
+                        val now = System.currentTimeMillis()
+                        if (!isFinal && now - lastFinalDisplayTime < 300L) {
+                            // Bỏ qua interim bị trễ ngay sau khi vừa chốt câu
+                            continue
+                        }
+                        if (isFinal && normalizedOriginal.equals(lastPublishedOriginal, ignoreCase = true) && lastPublishedFinal && now - lastFinalDisplayTime < 4000L) {
+                            continue
+                        }
+
+                        if (isFinal) {
+                            lastFinalDisplayTime = now
+                        }
+                        lastPublishedOriginal = normalizedOriginal
+                        lastPublishedFinal = isFinal
 
                         if (enableOverlay) {
                             mainHandler.post {

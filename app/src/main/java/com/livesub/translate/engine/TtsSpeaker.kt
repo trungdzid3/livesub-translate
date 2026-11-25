@@ -17,14 +17,19 @@ class TtsSpeaker(context: Context) {
     private var isReady = false
     private val pendingQueueCount = AtomicInteger(0)
 
+    private var lastSpokenNormalized = ""
+    private var lastSpokenTimeMs = 0L
+
+    private val ttsAudioAttributes: AudioAttributes by lazy {
+        AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+    }
+
     private val focusRequest: AudioFocusRequest by lazy {
         AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
+            .setAudioAttributes(ttsAudioAttributes)
             .build()
     }
 
@@ -35,6 +40,7 @@ class TtsSpeaker(context: Context) {
                 val viLocale = Locale("vi", "VN")
                 val res = engine.setLanguage(viLocale)
                 if (res != TextToSpeech.LANG_MISSING_DATA && res != TextToSpeech.LANG_NOT_SUPPORTED) {
+                    engine.setAudioAttributes(ttsAudioAttributes)
                     engine.setSpeechRate(1.15f)
                     engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {}
@@ -59,9 +65,18 @@ class TtsSpeaker(context: Context) {
         }
     }
 
+    @Synchronized
     fun speak(text: String) {
         if (!isReady || text.isBlank()) return
         val engine = tts ?: return
+
+        val normalized = text.trim().lowercase(Locale.getDefault())
+        val now = System.currentTimeMillis()
+        if (normalized == lastSpokenNormalized && now - lastSpokenTimeMs < 5000L) {
+            return
+        }
+        lastSpokenNormalized = normalized
+        lastSpokenTimeMs = now
 
         val queueMode = if (pendingQueueCount.get() >= 2) {
             pendingQueueCount.set(1)
@@ -72,7 +87,7 @@ class TtsSpeaker(context: Context) {
         }
 
         audioManager.requestAudioFocus(focusRequest)
-        val id = "sub_${System.currentTimeMillis()}"
+        val id = "sub_${now}"
         val result = engine.speak(text, queueMode, null, id)
         if (result == TextToSpeech.ERROR) {
             if (pendingQueueCount.decrementAndGet() <= 0) {
