@@ -556,9 +556,9 @@
                         app:dividerInsetEnd="14dp"
                         app:dividerInsetStart="64dp" />
 
-                    <!-- Row 4: Google Speech Live -->
+                    <!-- Row 4: Whisper Accurate Mode -->
                     <LinearLayout
-                        android:id="@+id/rowGoogleLive"
+                        android:id="@+id/rowWhisperMode"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:background="?attr/selectableItemBackground"
@@ -592,16 +592,16 @@
                             android:layout_height="wrap_content"
                             android:layout_marginHorizontal="14dp"
                             android:layout_weight="1"
-                            android:text="@string/option_google_live_title"
+                            android:text="@string/option_whisper_mode_title"
                             android:textAppearance="?attr/textAppearanceBodyLarge"
                             android:textColor="?attr/colorOnSurface" />
 
                         <com.google.android.material.materialswitch.MaterialSwitch
-                            android:id="@+id/switchGoogleLive"
+                            android:id="@+id/switchWhisperMode"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:checked="true"
-                            android:contentDescription="@string/option_google_live_title" />
+                            android:contentDescription="@string/option_whisper_mode_title" />
                     </LinearLayout>
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>

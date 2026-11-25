@@ -17,18 +17,16 @@ import android.media.AudioPlaybackConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.speech.SpeechRecognizer
 import androidx.core.app.NotificationCompat
 import com.livesub.translate.R
-import com.livesub.translate.engine.GoogleSpeechPipeEngine
 import com.livesub.translate.engine.GoogleTranslator
 import com.livesub.translate.engine.ModelManager
 import com.livesub.translate.engine.StreamingAsrEngine
 import com.livesub.translate.engine.TtsSpeaker
+import com.livesub.translate.engine.WhisperVadEngine
 import com.livesub.translate.model.AsrMode
 import com.livesub.translate.model.FilmLanguage
 import com.livesub.translate.overlay.SubtitleOverlayManager
@@ -88,8 +86,8 @@ class LiveTranslateService : Service() {
     private var audioManager: AudioManager? = null
     private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
     private var audioRecord: AudioRecord? = null
+    private var whisperEngine: WhisperVadEngine? = null
     private var asrEngine: StreamingAsrEngine? = null
-    private var googleSpeechEngine: GoogleSpeechPipeEngine? = null
     private var translator: GoogleTranslator? = null
     private var overlayManager: SubtitleOverlayManager? = null
     private var ttsSpeaker: TtsSpeaker? = null
@@ -105,7 +103,7 @@ class LiveTranslateService : Service() {
     @Volatile
     private var lastPlaybackChangeMs = 0L
     private var currentLanguage = FilmLanguage.ENGLISH
-    private var currentAsrMode = AsrMode.GOOGLE_LIVE
+    private var currentAsrMode = AsrMode.WHISPER_ACCURATE
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -145,27 +143,9 @@ class LiveTranslateService : Service() {
                 currentLanguage = runCatching { FilmLanguage.valueOf(langName) }
                     .getOrDefault(FilmLanguage.ENGLISH)
 
-                val defaultMode = if (
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                    SpeechRecognizer.isRecognitionAvailable(this)
-                ) {
-                    AsrMode.GOOGLE_LIVE
-                } else {
-                    AsrMode.OFFLINE_SHERPA
-                }
-                val requestedModeName = intent.getStringExtra(EXTRA_ASR_MODE)
-                val requestedMode = requestedModeName?.let {
-                    runCatching { AsrMode.valueOf(it) }.getOrNull()
-                } ?: defaultMode
-                currentAsrMode = if (
-                    requestedMode == AsrMode.GOOGLE_LIVE &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                    SpeechRecognizer.isRecognitionAvailable(this)
-                ) {
-                    AsrMode.GOOGLE_LIVE
-                } else {
-                    AsrMode.OFFLINE_SHERPA
-                }
+                val modeName = intent.getStringExtra(EXTRA_ASR_MODE) ?: AsrMode.WHISPER_ACCURATE.name
+                currentAsrMode = runCatching { AsrMode.valueOf(modeName) }
+                    .getOrDefault(AsrMode.WHISPER_ACCURATE)
 
                 enableOverlay = intent.getBooleanExtra(EXTRA_ENABLE_OVERLAY, true)
                 enableTts = intent.getBooleanExtra(EXTRA_ENABLE_TTS, true)
@@ -242,9 +222,6 @@ class LiveTranslateService : Service() {
             override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
                 needAsrReset = true
                 lastPlaybackChangeMs = System.currentTimeMillis()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    googleSpeechEngine?.restartPipe()
-                }
             }
         }
         playbackCallback = pbCallback
@@ -258,82 +235,108 @@ class LiveTranslateService : Service() {
         ttsSpeaker = TtsSpeaker(this)
 
         captureJob = serviceScope.launch {
-            val rawAudioChannel = Channel<FloatArray>(capacity = 128, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+            val rawAudioChannel = Channel<FloatArray>(capacity = 256, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+            val segmentChannel = Channel<FloatArray>(capacity = 12, onBufferOverflow = BufferOverflow.DROP_OLDEST)
             val finalTranslateChannel = Channel<String>(capacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
             val interimTranslateChannel = Channel<String>(capacity = Channel.CONFLATED)
 
-            var lastInterimNorm = ""
-            var lastInterimTime = 0L
-            var lastFinalNorm = ""
-            var lastFinalTime = 0L
-
-            fun handleRecognitionResult(text: String, isFinal: Boolean) {
-                val norm = text.trim().lowercase()
-                val now = System.currentTimeMillis()
-                if (isFinal) {
-                    lastInterimNorm = ""
-                    lastInterimTime = 0L
-                    val isDuplicateFinal = norm.isEmpty() ||
-                        (norm == lastFinalNorm && now - lastFinalTime < 4000L)
-                    if (isDuplicateFinal) return
-
-                    lastFinalNorm = norm
-                    lastFinalTime = now
-                    interimTranslateChannel.tryReceive()
-                    finalTranslateChannel.trySend(text)
-                } else {
-                    val isDupInterim = norm.isEmpty() ||
-                        norm == lastInterimNorm ||
-                        (norm == lastFinalNorm && now - lastFinalTime < 4000L)
-                    if (!isDupInterim && now - lastInterimTime >= INTERIM_DEBOUNCE_MS) {
-                        lastInterimNorm = norm
-                        lastInterimTime = now
-                        interimTranslateChannel.trySend(text)
-                    }
-                }
-            }
-
             try {
+                val modelManager = ModelManager(applicationContext)
                 val googleTranslator = GoogleTranslator(currentLanguage)
                 translator = googleTranslator
 
-                val useGoogleLive = currentAsrMode == AsrMode.GOOGLE_LIVE &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                var whisperVad: WhisperVadEngine? = null
+                var streamingAsr: StreamingAsrEngine? = null
 
-                val streamingAsr: StreamingAsrEngine?
-                val googleLiveEngine: GoogleSpeechPipeEngine?
-
-                if (useGoogleLive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    streamingAsr = null
-                    googleLiveEngine = GoogleSpeechPipeEngine(
+                if (currentAsrMode == AsrMode.WHISPER_ACCURATE) {
+                    whisperVad = WhisperVadEngine(
                         context = applicationContext,
                         language = currentLanguage,
-                        onResult = { text, isFinal -> handleRecognitionResult(text, isFinal) },
-                        onFatalUnsupported = { reason ->
-                            updateNotification(reason)
-                            stopAll()
-                            stopSelf()
-                        }
-                    ).also {
-                        googleSpeechEngine = it
-                        it.start()
-                    }
+                        modelDir = modelManager.getWhisperDir()
+                    ).also { whisperEngine = it }
                 } else {
-                    googleLiveEngine = null
-                    val modelDir = ModelManager(applicationContext).getModelDir(currentLanguage)
-                    streamingAsr = StreamingAsrEngine(modelDir).also { asrEngine = it }
+                    streamingAsr = StreamingAsrEngine(modelManager.getModelDir(currentLanguage))
+                        .also { asrEngine = it }
                 }
 
                 var recorder = createAudioRecord(projection)
                 audioRecord = recorder
                 recorder.startRecording()
 
-                val modeLabel = if (useGoogleLive) "Google Live" else "Offline AI"
+                val modeLabel = if (whisperVad != null) "Whisper" else "Streaming"
                 updateNotification("Đang dịch $modeLabel (${currentLanguage.displayName} -> Việt)")
 
-                // Luồng 2 (chỉ dùng cho Offline Sherpa-ONNX): Nhận diện streaming từ rawAudioChannel
-                val asrJob = if (streamingAsr != null) {
-                    launch(Dispatchers.Default) {
+                var vadJob: Job? = null
+                var decodeJob: Job? = null
+
+                if (whisperVad != null) {
+                    // Luồng 2 (Whisper): Chạy Silero VAD tách câu thoại từ rawAudioChannel
+                    vadJob = launch(Dispatchers.Default) {
+                        for (chunk in rawAudioChannel) {
+                            if (needAsrReset) {
+                                needAsrReset = false
+                                whisperVad.resetVad()
+                            }
+                            val segments = whisperVad.feedVad(chunk)
+                            for (seg in segments) {
+                                segmentChannel.trySend(seg)
+                            }
+                        }
+                    }
+
+                    // Luồng 3 (Whisper): Giải mã segment -> Dịch Google -> Overlay + TTS + Broadcast
+                    decodeJob = launch(Dispatchers.IO) {
+                        var lastFinalNorm = ""
+                        var lastFinalTime = 0L
+
+                        for (segment in segmentChannel) {
+                            val original = whisperVad.transcribeSegment(segment)
+                            val norm = original.trim().lowercase()
+                            val now = System.currentTimeMillis()
+                            if (norm.isEmpty() || (norm == lastFinalNorm && now - lastFinalTime < 4000L)) {
+                                continue
+                            }
+
+                            val normalizedOriginal = googleTranslator.normalizeCase(original)
+                            val translated = try {
+                                googleTranslator.translate(normalizedOriginal)
+                            } catch (_: Exception) {
+                                ""
+                            }
+                            if (translated.isBlank()) continue
+
+                            lastFinalNorm = norm
+                            lastFinalTime = now
+
+                            if (enableOverlay) {
+                                mainHandler.post {
+                                    overlayManager?.updateSubtitle(
+                                        original = normalizedOriginal,
+                                        translated = translated,
+                                        showOriginal = showOriginal,
+                                        isFinal = true
+                                    )
+                                }
+                            }
+                            if (enableTts) {
+                                ttsSpeaker?.speak(translated)
+                            }
+                            broadcastStatus(
+                                running = true,
+                                original = normalizedOriginal,
+                                translated = translated,
+                                isFinal = true
+                            )
+                        }
+                    }
+                } else if (streamingAsr != null) {
+                    // Luồng 2 (Streaming Fast): Nhận diện streaming liên tục
+                    vadJob = launch(Dispatchers.Default) {
+                        var lastInterimNorm = ""
+                        var lastInterimTime = 0L
+                        var lastFinalNorm = ""
+                        var lastFinalTime = 0L
+
                         for (chunk in rawAudioChannel) {
                             if (needAsrReset) {
                                 needAsrReset = false
@@ -344,68 +347,82 @@ class LiveTranslateService : Service() {
                             }
 
                             val update = streamingAsr.processAudio(chunk) ?: continue
-                            handleRecognitionResult(update.text, update.isFinal)
-                        }
-                    }
-                } else {
-                    null
-                }
+                            val norm = update.text.trim().lowercase()
+                            val now = System.currentTimeMillis()
 
-                // Luồng 3: Dịch ưu tiên câu đã chốt (final) trước interim; bọc try-catch để không bao giờ chết luồng
-                val translateJob = launch(Dispatchers.IO) {
-                    var lastFinalDisplayTime = 0L
-                    var lastPublishedOriginal = ""
-                    var lastPublishedFinal = false
-
-                    while (isActive) {
-                        val (textToTranslate, isFinal) = select<Pair<String, Boolean>> {
-                            finalTranslateChannel.onReceive { it to true }
-                            interimTranslateChannel.onReceive { it to false }
-                        }
-
-                        val normalizedOriginal = googleTranslator.normalizeCase(textToTranslate)
-                        val translated = try {
-                            googleTranslator.translate(normalizedOriginal)
-                        } catch (_: Exception) {
-                            ""
-                        }
-                        if (translated.isBlank()) continue
-
-                        val now = System.currentTimeMillis()
-                        if (!isFinal && now - lastFinalDisplayTime < 300L) {
-                            continue
-                        }
-                        if (isFinal && normalizedOriginal.equals(lastPublishedOriginal, ignoreCase = true) && lastPublishedFinal && now - lastFinalDisplayTime < 4000L) {
-                            continue
-                        }
-
-                        if (isFinal) {
-                            lastFinalDisplayTime = now
-                        }
-                        lastPublishedOriginal = normalizedOriginal
-                        lastPublishedFinal = isFinal
-
-                        if (enableOverlay) {
-                            mainHandler.post {
-                                overlayManager?.updateSubtitle(
-                                    original = normalizedOriginal,
-                                    translated = translated,
-                                    showOriginal = showOriginal,
-                                    isFinal = isFinal
-                                )
+                            if (update.isFinal) {
+                                lastInterimNorm = ""
+                                lastInterimTime = 0L
+                                if (norm.isEmpty() || (norm == lastFinalNorm && now - lastFinalTime < 4000L)) {
+                                    continue
+                                }
+                                lastFinalNorm = norm
+                                lastFinalTime = now
+                                interimTranslateChannel.tryReceive()
+                                finalTranslateChannel.trySend(update.text)
+                            } else {
+                                val isDupInterim = norm.isEmpty() ||
+                                    norm == lastInterimNorm ||
+                                    (norm == lastFinalNorm && now - lastFinalTime < 4000L)
+                                if (!isDupInterim && now - lastInterimTime >= INTERIM_DEBOUNCE_MS) {
+                                    lastInterimNorm = norm
+                                    lastInterimTime = now
+                                    interimTranslateChannel.trySend(update.text)
+                                }
                             }
                         }
+                    }
 
-                        if (isFinal && enableTts) {
-                            ttsSpeaker?.speak(translated)
+                    // Luồng 3 (Streaming Fast): Dịch ưu tiên final trước interim
+                    decodeJob = launch(Dispatchers.IO) {
+                        var lastFinalDisplayTime = 0L
+                        var lastPublishedOriginal = ""
+                        var lastPublishedFinal = false
+
+                        while (isActive) {
+                            val (textToTranslate, isFinal) = select<Pair<String, Boolean>> {
+                                finalTranslateChannel.onReceive { it to true }
+                                interimTranslateChannel.onReceive { it to false }
+                            }
+
+                            val normalizedOriginal = googleTranslator.normalizeCase(textToTranslate)
+                            val translated = try {
+                                googleTranslator.translate(normalizedOriginal)
+                            } catch (_: Exception) {
+                                ""
+                            }
+                            if (translated.isBlank()) continue
+
+                            val now = System.currentTimeMillis()
+                            if (!isFinal && now - lastFinalDisplayTime < 300L) continue
+                            if (isFinal && normalizedOriginal.equals(lastPublishedOriginal, ignoreCase = true) && lastPublishedFinal && now - lastFinalDisplayTime < 4000L) {
+                                continue
+                            }
+
+                            if (isFinal) lastFinalDisplayTime = now
+                            lastPublishedOriginal = normalizedOriginal
+                            lastPublishedFinal = isFinal
+
+                            if (enableOverlay) {
+                                mainHandler.post {
+                                    overlayManager?.updateSubtitle(
+                                        original = normalizedOriginal,
+                                        translated = translated,
+                                        showOriginal = showOriginal,
+                                        isFinal = isFinal
+                                    )
+                                }
+                            }
+                            if (isFinal && enableTts) {
+                                ttsSpeaker?.speak(translated)
+                            }
+                            broadcastStatus(
+                                running = true,
+                                original = normalizedOriginal,
+                                translated = translated,
+                                isFinal = isFinal
+                            )
                         }
-
-                        broadcastStatus(
-                            running = true,
-                            original = normalizedOriginal,
-                            translated = translated,
-                            isFinal = isFinal
-                        )
                     }
                 }
 
@@ -416,11 +433,9 @@ class LiveTranslateService : Service() {
                 var zeroReadStartMs = 0L
                 var zeroPeakAfterChangeStartMs = 0L
 
-                fun resetActiveAsr() {
+                fun resetActiveEngine() {
+                    whisperVad?.resetVad()
                     streamingAsr?.resetStream()
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        googleLiveEngine?.restartPipe()
-                    }
                 }
 
                 while (isActive) {
@@ -438,7 +453,7 @@ class LiveTranslateService : Service() {
                         recorder = createAudioRecord(projection)
                         audioRecord = recorder
                         recorder.startRecording()
-                        resetActiveAsr()
+                        resetActiveEngine()
                         zeroReadStartMs = 0L
                         zeroPeakAfterChangeStartMs = 0L
                         continue
@@ -458,7 +473,7 @@ class LiveTranslateService : Service() {
                             recorder = createAudioRecord(projection)
                             audioRecord = recorder
                             recorder.startRecording()
-                            resetActiveAsr()
+                            resetActiveEngine()
                             zeroReadStartMs = 0L
                         }
                         delay(20L)
@@ -466,12 +481,12 @@ class LiveTranslateService : Service() {
                     }
 
                     zeroReadStartMs = 0L
+                    val floatSlice = FloatArray(read)
                     var sumSq = 0.0
                     var maxPeak = 0f
-                    val floatSlice = if (streamingAsr != null) FloatArray(read) else null
                     for (i in 0 until read) {
                         val v = chunkShorts[i] / 32768.0f
-                        if (floatSlice != null) floatSlice[i] = v
+                        floatSlice[i] = v
                         sumSq += v * v
                         val a = abs(v)
                         if (a > maxPeak) maxPeak = a
@@ -493,7 +508,7 @@ class LiveTranslateService : Service() {
                             recorder = createAudioRecord(projection)
                             audioRecord = recorder
                             recorder.startRecording()
-                            resetActiveAsr()
+                            resetActiveEngine()
                             zeroPeakAfterChangeStartMs = 0L
                             lastPlaybackChangeMs = 0L
                             continue
@@ -502,11 +517,7 @@ class LiveTranslateService : Service() {
                         zeroPeakAfterChangeStartMs = 0L
                     }
 
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && googleLiveEngine != null) {
-                        googleLiveEngine.writePcm16(chunkShorts, read)
-                    } else if (floatSlice != null) {
-                        rawAudioChannel.trySend(floatSlice)
-                    }
+                    rawAudioChannel.trySend(floatSlice)
 
                     if (now - lastLevelBroadcast > 200L) {
                         lastLevelBroadcast = now
@@ -517,14 +528,16 @@ class LiveTranslateService : Service() {
                 }
 
                 rawAudioChannel.close()
+                segmentChannel.close()
                 finalTranslateChannel.close()
                 interimTranslateChannel.close()
-                asrJob?.cancel()
-                translateJob.cancel()
+                vadJob?.cancel()
+                decodeJob?.cancel()
             } catch (e: Exception) {
                 updateNotification("Lỗi: ${e.message ?: "Không thể thu âm thanh"}")
             } finally {
                 rawAudioChannel.close()
+                segmentChannel.close()
                 finalTranslateChannel.close()
                 interimTranslateChannel.close()
                 stopAll()
@@ -550,10 +563,8 @@ class LiveTranslateService : Service() {
         }
         audioRecord = null
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            runCatching { googleSpeechEngine?.release() }
-        }
-        googleSpeechEngine = null
+        runCatching { whisperEngine?.release() }
+        whisperEngine = null
 
         runCatching { asrEngine?.release() }
         asrEngine = null

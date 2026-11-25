@@ -14,7 +14,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.speech.SpeechRecognizer
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.TextView
@@ -46,8 +45,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var modelManager: ModelManager
     private var selectedLanguage = FilmLanguage.ENGLISH
-    private var selectedAsrMode = AsrMode.OFFLINE_SHERPA
-    private var isGoogleLiveSupported = false
+    private var selectedAsrMode = AsrMode.WHISPER_ACCURATE
     private var isDownloadingModel = false
 
     private val requestPermissionsLauncher = registerForActivityResult(
@@ -132,9 +130,7 @@ class MainActivity : AppCompatActivity() {
         applyEdgeToEdgeInsets()
 
         modelManager = ModelManager(this)
-        isGoogleLiveSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            SpeechRecognizer.isRecognitionAvailable(this)
-        selectedAsrMode = if (isGoogleLiveSupported) AsrMode.GOOGLE_LIVE else AsrMode.OFFLINE_SHERPA
+        selectedAsrMode = AsrMode.WHISPER_ACCURATE
 
         setupLanguageSelector()
         setupControls()
@@ -215,21 +211,14 @@ class MainActivity : AppCompatActivity() {
         binding.rowOverlay.setOnClickListener { binding.switchOverlay.toggle() }
         binding.rowTts.setOnClickListener { binding.switchTts.toggle() }
         binding.rowShowOriginal.setOnClickListener { binding.switchShowOriginal.toggle() }
-        binding.rowGoogleLive.setOnClickListener {
-            if (isGoogleLiveSupported) {
-                binding.switchGoogleLive.toggle()
-            } else {
-                Toast.makeText(this, R.string.google_live_unsupported, Toast.LENGTH_SHORT).show()
-            }
-        }
+        binding.rowWhisperMode.setOnClickListener { binding.switchWhisperMode.toggle() }
 
-        binding.switchGoogleLive.isChecked = isGoogleLiveSupported
-        binding.switchGoogleLive.isEnabled = isGoogleLiveSupported
-        binding.switchGoogleLive.setOnCheckedChangeListener { _, isChecked ->
-            selectedAsrMode = if (isChecked && isGoogleLiveSupported) {
-                AsrMode.GOOGLE_LIVE
+        binding.switchWhisperMode.isChecked = true
+        binding.switchWhisperMode.setOnCheckedChangeListener { _, isChecked ->
+            selectedAsrMode = if (isChecked) {
+                AsrMode.WHISPER_ACCURATE
             } else {
-                AsrMode.OFFLINE_SHERPA
+                AsrMode.STREAMING_FAST
             }
             if (!isDownloadingModel) {
                 refreshModelStatus()
@@ -260,29 +249,17 @@ class MainActivity : AppCompatActivity() {
         binding.tvDownloadPercent.visibility = View.GONE
         binding.ivModelState.visibility = View.VISIBLE
 
-        if (selectedAsrMode == AsrMode.GOOGLE_LIVE) {
+        val ready = if (selectedAsrMode == AsrMode.WHISPER_ACCURATE) {
+            binding.tvModelTitle.text = getString(R.string.whisper_package_title, 197)
+            modelManager.isWhisperReady()
+        } else {
             binding.tvModelTitle.text = getString(
-                R.string.google_live_package_title,
-                selectedLanguage.displayName
+                R.string.model_package_title,
+                selectedLanguage.displayName,
+                selectedLanguage.approxSizeMb
             )
-            binding.tvModelStatus.text = getString(R.string.google_live_ready)
-            binding.ivModelState.setImageResource(R.drawable.ic_check_circle)
-            binding.cardModelIconBg.setCardBackgroundColor(
-                MaterialColors.getColor(binding.cardModelIconBg, com.google.android.material.R.attr.colorPrimaryContainer)
-            )
-            binding.ivModelState.imageTintList = ColorStateList.valueOf(
-                MaterialColors.getColor(binding.ivModelState, com.google.android.material.R.attr.colorOnPrimaryContainer)
-            )
-            binding.btnDownloadModel.visibility = View.GONE
-            return
+            modelManager.isAsrModelReady(selectedLanguage)
         }
-
-        binding.tvModelTitle.text = getString(
-            R.string.model_package_title,
-            selectedLanguage.displayName,
-            selectedLanguage.approxSizeMb
-        )
-        val ready = modelManager.isAsrModelReady(selectedLanguage)
 
         if (ready) {
             binding.tvModelStatus.text = getString(R.string.model_ready_offline)
@@ -322,13 +299,18 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             try {
-                modelManager.ensureModelsReady(selectedLanguage) { status, percent ->
+                val onProgress: (String, Int) -> Unit = { status, percent ->
                     runOnUiThread {
                         val clamped = percent.coerceIn(0, 100)
                         binding.tvModelStatus.text = status
                         binding.tvDownloadPercent.text = getString(R.string.update_percent_format, clamped)
                         binding.progressDownload.setProgress(clamped, true)
                     }
+                }
+                if (selectedAsrMode == AsrMode.WHISPER_ACCURATE) {
+                    modelManager.ensureWhisperReady(selectedLanguage, onProgress)
+                } else {
+                    modelManager.ensureModelsReady(selectedLanguage, onProgress)
                 }
                 Toast.makeText(this@MainActivity, R.string.download_complete, Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
@@ -344,7 +326,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startLiveTranslateFlow() {
-        if (selectedAsrMode == AsrMode.OFFLINE_SHERPA && !modelManager.isAsrModelReady(selectedLanguage)) {
+        if (selectedAsrMode == AsrMode.WHISPER_ACCURATE && !modelManager.isWhisperReady()) {
+            Toast.makeText(this, R.string.msg_download_whisper_first, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (selectedAsrMode == AsrMode.STREAMING_FAST && !modelManager.isAsrModelReady(selectedLanguage)) {
             Toast.makeText(
                 this,
                 getString(R.string.msg_download_first, selectedLanguage.displayName),

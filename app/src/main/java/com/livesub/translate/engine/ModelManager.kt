@@ -6,6 +6,9 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.livesub.translate.model.FilmLanguage
+import com.livesub.translate.model.WHISPER_FOLDER
+import com.livesub.translate.model.WHISPER_SIZE_MB
+import com.livesub.translate.model.WHISPER_URL
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -27,6 +30,20 @@ class ModelManager(private val context: Context) {
     fun getModelDir(language: FilmLanguage): File =
         File(modelsRoot, language.modelFolderName)
 
+    fun getWhisperDir(): File =
+        File(modelsRoot, WHISPER_FOLDER)
+
+    fun isWhisperReady(): Boolean {
+        val dir = getWhisperDir()
+        if (!dir.exists() || !dir.isDirectory) return false
+        val encoder = File(dir, "base-encoder.int8.onnx")
+        val decoder = File(dir, "base-decoder.int8.onnx")
+        val tokens = File(dir, "base-tokens.txt")
+        return encoder.exists() && encoder.length() > 18L * 1024L * 1024L &&
+            decoder.exists() && decoder.length() > 45L * 1024L * 1024L &&
+            tokens.exists() && tokens.length() > 0L
+    }
+
     fun isAsrModelReady(language: FilmLanguage): Boolean {
         val dir = getModelDir(language)
         if (!dir.exists() || !dir.isDirectory) return false
@@ -39,42 +56,74 @@ class ModelManager(private val context: Context) {
         return hasEncoder && hasDecoder && hasJoiner
     }
 
+    suspend fun ensureWhisperReady(
+        language: FilmLanguage,
+        onProgress: (status: String, percent: Int) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        if (!isWhisperReady()) {
+            downloadAndExtractArchive(
+                archiveName = "$WHISPER_FOLDER.tar.bz2",
+                targetDir = getWhisperDir(),
+                downloadUrl = WHISPER_URL,
+                label = "Whisper Đa Ngôn Ngữ",
+                approxSizeMb = WHISPER_SIZE_MB,
+                onProgress = onProgress
+            )
+            if (!isWhisperReady()) {
+                throw IllegalStateException("Giải nén hoàn tất nhưng thiếu file model Whisper trong ${getWhisperDir().name}")
+            }
+        }
+        onProgress("Đang chuẩn bị gói dịch offline dự phòng (${language.displayName} -> Việt)...", 92)
+        runCatching { downloadMlKitModel(language) }
+        onProgress("Whisper Đa Ngôn Ngữ đã sẵn sàng.", 100)
+    }
+
     suspend fun ensureModelsReady(
         language: FilmLanguage,
         onProgress: (status: String, percent: Int) -> Unit
     ) = withContext(Dispatchers.IO) {
         if (!isAsrModelReady(language)) {
-            downloadAndExtractAsrModel(language, onProgress)
+            downloadAndExtractArchive(
+                archiveName = "${language.modelFolderName}.tar.bz2",
+                targetDir = getModelDir(language),
+                downloadUrl = language.downloadUrl,
+                label = "Streaming ${language.displayName}",
+                approxSizeMb = language.approxSizeMb,
+                onProgress = onProgress
+            )
+            if (!isAsrModelReady(language)) {
+                throw IllegalStateException("Giải nén hoàn tất nhưng thiếu file model ONNX trong ${getModelDir(language).name}")
+            }
         }
         onProgress("Đang chuẩn bị gói dịch offline dự phòng (${language.displayName} -> Việt)...", 92)
         runCatching { downloadMlKitModel(language) }
         onProgress("Dữ liệu ${language.displayName} đã sẵn sàng.", 100)
     }
 
-    private fun downloadAndExtractAsrModel(
-        language: FilmLanguage,
+    private fun downloadAndExtractArchive(
+        archiveName: String,
+        targetDir: File,
+        downloadUrl: String,
+        label: String,
+        approxSizeMb: Int,
         onProgress: (status: String, percent: Int) -> Unit
     ) {
-        val archiveFile = File(modelsRoot, "${language.modelFolderName}.tar.bz2")
-        val targetDir = getModelDir(language)
+        val archiveFile = File(modelsRoot, archiveName)
         if (targetDir.exists()) {
             targetDir.deleteRecursively()
         }
 
         try {
-            onProgress("Đang kết nối tải model streaming ${language.displayName} (~${language.approxSizeMb} MB)...", 2)
-            downloadFileWithRedirect(language.downloadUrl, archiveFile) { downloaded, total ->
+            onProgress("Đang kết nối tải $label (~$approxSizeMb MB)...", 2)
+            downloadFileWithRedirect(downloadUrl, archiveFile) { downloaded, total ->
                 val pct = if (total > 0) ((downloaded * 75L) / total).toInt().coerceIn(2, 75) else 25
                 val mb = downloaded / (1024 * 1024)
-                val totalMb = if (total > 0) total / (1024 * 1024) else language.approxSizeMb.toLong()
-                onProgress("Đang tải model: ${mb}MB / ${totalMb}MB", pct)
+                val totalMb = if (total > 0) total / (1024 * 1024) else approxSizeMb.toLong()
+                onProgress("Đang tải $label: ${mb}MB / ${totalMb}MB", pct)
             }
 
-            onProgress("Đang giải nén model nhận diện streaming...", 78)
+            onProgress("Đang giải nén $label...", 78)
             extractTarBz2(archiveFile, modelsRoot)
-            if (!isAsrModelReady(language)) {
-                throw IllegalStateException("Giải nén hoàn tất nhưng thiếu file model ONNX trong ${targetDir.name}")
-            }
             onProgress("Giải nén hoàn tất.", 90)
         } finally {
             if (archiveFile.exists()) {
